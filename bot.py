@@ -16,10 +16,18 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import Command, CommandStart, or_f
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -167,7 +175,7 @@ def schedule_dose(chat_id: int, dose_no: int, when: datetime) -> None:
     save_state()
     scheduler.add_job(
         send_dose,
-        trigger=DateTrigger(run_date=when),
+        trigger=DateTrigger(run_date=when, timezone=TZ),
         args=[chat_id, dose_no, stamp],
         id=job_id(chat_id, dose_no),
         replace_existing=True,
@@ -272,7 +280,16 @@ def start_text(first_at: datetime, moment: datetime) -> str:
         "Здравствуйте. Я напомню о приёме лекарств 5 раз за день.\n\n"
         f"{plan}\n"
         "Когда на первом напоминании нажмёте «Принято», посчитаю время приёмов 2–5. "
-        "Последний будет ровно в 23:00."
+        "Последний будет ровно в 23:00.\n\n"
+        "Кнопка «Проверка» только отвечает, что бот жив. Расписание она не меняет."
+    )
+
+
+def test_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Проверка")]],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -281,7 +298,17 @@ async def cmd_start(message: Message) -> None:
     moment = now_msk()
     first_at = first_slot(moment)
     begin_day(message.chat.id, first_at)
-    await message.answer(start_text(first_at, moment))
+    await message.answer(start_text(first_at, moment), reply_markup=test_keyboard())
+
+
+@dp.message(or_f(Command("ping"), F.text == "Проверка"))
+async def cmd_ping(message: Message) -> None:
+    moment = now_msk()
+    log.info("Проверка от чата %s", message.chat.id)
+    await message.answer(
+        f"Бот на связи.\nСейчас {fmt(moment)} (МСК).\nРасписание не менял.",
+        reply_markup=test_keyboard(),
+    )
 
 
 def dose_of(state: dict, dose_no: int) -> dict | None:
@@ -407,8 +434,26 @@ async def serve_health() -> None:
         await server.serve_forever()
 
 
+async def keep_awake() -> None:
+    """Бесплатный Render засыпает без входящих запросов. Пингуем свой публичный адрес."""
+    url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if not url:
+        return
+    await asyncio.sleep(20)
+    timeout = aiohttp.ClientTimeout(total=30)
+    while True:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{url}/health") as response:
+                    log.info("Пинг хостинга: %s", response.status)
+        except Exception:
+            log.exception("Пинг хостинга не прошёл")
+        await asyncio.sleep(8 * 60)
+
+
 async def main() -> None:
     health_task = asyncio.create_task(serve_health())
+    wake_task = asyncio.create_task(keep_awake())
     load_state()
     scheduler.start()
     restore_jobs()
@@ -426,10 +471,11 @@ async def main() -> None:
     try:
         await dp.start_polling(
             bot,
-            drop_pending_updates=True,
+            drop_pending_updates=False,
             allowed_updates=["message", "callback_query"],
         )
     finally:
+        wake_task.cancel()
         health_task.cancel()
         scheduler.shutdown(wait=False)
         await bot.session.close()
