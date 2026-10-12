@@ -1,0 +1,4 @@
+schedule.json
+__pycache__/
+*.tmp
+.env
